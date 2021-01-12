@@ -12,8 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from typing import Union
+from html.parser import HTMLParser
+from typing import Iterable, List, Optional, Tuple, Union
+from urllib.parse import urlencode
 
 from twisted.internet.defer import succeed
 
@@ -27,7 +28,7 @@ from synapse.types import JsonDict, UserID
 
 from tests import unittest
 from tests.handlers.test_oidc import HAS_OIDC
-from tests.rest.client.v1.utils import TEST_OIDC_CONFIG
+from tests.rest.client.v1.utils import TEST_OIDC_AUTH_ENDPOINT, TEST_OIDC_CONFIG
 from tests.server import FakeChannel
 from tests.unittest import override_config, skip_unless
 
@@ -419,3 +420,59 @@ class UIAuthTests(unittest.HomeserverTestCase):
         self.assertIn({"stages": ["m.login.password"]}, flows)
         self.assertIn({"stages": ["m.login.sso"]}, flows)
         self.assertEqual(len(flows), 2)
+
+    @skip_unless(HAS_OIDC, "requires OIDC")
+    @override_config({"oidc_config": TEST_OIDC_CONFIG})
+    def test_redirect_to_sso_provider(self):
+        # if a user logged in via OIDC, then when the come to do a UI Auth via SSO,
+        # they should get sent to the OIDC IdP.
+
+        # log the user in
+        login_resp = self.helper.login_via_oidc(UserID.from_string(self.user).localpart)
+        self.assertEqual(login_resp["user_id"], self.user)
+
+        # initiate a UI Auth process by attempting to delete the device
+        channel = self.delete_device(self.user_tok, self.device_id, 401)
+
+        # check that SSO is offered
+        flows = channel.json_body["flows"]
+        self.assertIn({"stages": ["m.login.sso"]}, flows)
+        session_id = channel.json_body["session"]
+
+        # The mechanism for sso is to use the fallback interface, so do that.
+        channel = self.make_request(
+            "GET",
+            "/_matrix/client/r0/auth/m.login.sso/fallback/web?"
+            + urlencode({"session": session_id}),
+        )
+
+        # we expect a confirmation page
+        self.assertEqual(channel.code, 200, channel.result)
+
+        # parse the confirmation page to fish out the link.
+        class ConfirmationPageParser(HTMLParser):
+            def __init__(self):
+                super().__init__()
+
+                self.links = []  # type: List[str]
+
+            def handle_starttag(
+                self, tag: str, attrs: Iterable[Tuple[str, Optional[str]]]
+            ) -> None:
+                attr_dict = dict(attrs)
+                if tag == "a":
+                    href = attr_dict["href"]
+                    if href:
+                        self.links.append(href)
+
+            def error(_, message):
+                self.fail(message)
+
+        p = ConfirmationPageParser()
+        p.feed(channel.result["body"].decode("utf-8"))
+        p.close()
+
+        # check that the link goes to the OIDC IdP.
+        self.assertEqual(len(p.links), 1, "not exactly one link in confirmation page")
+        path, params = p.links[0].split("?")
+        self.assertEqual(path, TEST_OIDC_AUTH_ENDPOINT)
